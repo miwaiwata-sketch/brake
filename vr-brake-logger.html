@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ブレーキタイミング記録</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  #ui { position: fixed; inset: 0; z-index: 10; background: #161616; color: #eee;
+        font-family: sans-serif; padding: 24px; overflow: auto; font-size: 18px; }
+  #ui h1 { font-size: 22px; margin-top: 0; }
+  #ui label { display: block; margin: 14px 0 4px; }
+  #ui input { font-size: 18px; padding: 6px; width: 100%; max-width: 420px; box-sizing: border-box; }
+  #ui button { font-size: 18px; padding: 10px 18px; margin: 10px 10px 0 0; }
+  #status { margin-top: 14px; color: #9cf; white-space: pre-wrap; }
+  table { border-collapse: collapse; margin-top: 12px; }
+  td, th { border: 1px solid #555; padding: 4px 10px; text-align: right; }
+  #assets { display: none; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h1>ブレーキタイミング記録（360度動画）</h1>
+
+  <div id="form">
+    <label>被験者ID</label>
+    <input id="pid" placeholder="例: P01">
+    <label>条件名（動画ごとに変える）</label>
+    <input id="cond" placeholder="例: eye_msg_hurry">
+    <label>動画ファイル（360度・正距円筒図法のmp4）</label>
+    <input id="file" type="file" accept="video/*">
+    <label>向きの補正（度）　動画の正面が違う方向なら変更</label>
+    <input id="yawOffset" type="number" value="-90">
+    <div>
+      <button id="start" disabled>開始（VRに入る）</button>
+    </div>
+    <p style="font-size:15px;color:#aaa">
+      操作：コントローラーのトリガーを、<b>ブレーキをかけたいと感じている間</b>ずっと押す（片手だけ使用）。<br>
+      押している間は映像がだんだん遅くなり（最小0.3倍）、離すと約1秒で元の速度に戻ります。<br>
+      PCでの動作テスト時はスペースキー（長押し）で代用できます。
+    </p>
+  </div>
+
+  <div id="results" class="hide">
+    <h2>記録結果</h2>
+    <div id="summary"></div>
+    <div>
+      <button id="dlEvents">ボタン記録CSVを保存</button>
+      <button id="dlHead">頭の向きCSVを保存</button>
+      <button id="again">次の動画へ</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+</div>
+
+<div id="assets"></div>
+
+<a-scene vr-mode-ui="enabled: false" loading-screen="enabled: false">
+  <a-camera id="cam" wasd-controls="enabled: false"></a-camera>
+</a-scene>
+
+<script>
+const THREE = AFRAME.THREE;
+const $ = id => document.getElementById(id);
+const scene = document.querySelector('a-scene');
+
+let vrOK = false;
+let video = null, sphere = null, loadingText = null;
+let meta = { pid: '', cond: '' };
+let events = [], head = [];
+let playing = false, finished = true, pressed = false, t0 = 0;
+
+function setStatus(s) { $('status').textContent = s; }
+
+// WebXR対応チェック
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-vr')
+    .then(v => { vrOK = v; setStatus(v ? 'VRに対応しています。' : 'VR非対応のため、通常画面でテストできます。'); })
+    .catch(() => setStatus('VR対応を確認できませんでした。'));
+} else {
+  setStatus('WebXR非対応（またはhttpsではない）ため、通常画面でテストできます。');
+}
+
+function checkReady() {
+  $('start').disabled = !($('file').files[0] && $('pid').value.trim());
+}
+$('file').onchange = checkReady;
+$('pid').oninput = checkReady;
+
+// ---- ボタン記録 ----
+function log(ev, hand) {
+  events.push({ event: ev, hand: hand || '', t: video.currentTime, wall: Math.round(performance.now() - t0), rate: rate.toFixed(2) });
+}
+function press(hand) { if (!playing || pressed) return; pressed = true; log('press', hand); }
+function release(hand) { if (!pressed) return; pressed = false; log('release', hand); }
+
+// PCテスト用: スペースキー
+window.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); press('keyboard'); } });
+window.addEventListener('keyup', e => { if (e.code === 'Space') release('keyboard'); });
+
+// VRコントローラー: トリガー = select
+scene.addEventListener('enter-vr', () => {
+  const session = scene.renderer.xr.getSession();
+  if (!session) return;
+  session.addEventListener('selectstart', e => press(e.inputSource.handedness));
+  session.addEventListener('selectend', e => release(e.inputSource.handedness));
+});
+scene.addEventListener('exit-vr', () => { if (playing) finish(true); });
+
+// ---- 頭の向きを50msごとに記録 ----
+const q = new THREE.Quaternion(), eul = new THREE.Euler();
+setInterval(() => {
+  if (!playing || !scene.camera) return;
+  scene.camera.getWorldQuaternion(q);
+  eul.setFromQuaternion(q, 'YXZ');
+  head.push([video.currentTime, eul.y * 180 / Math.PI, eul.x * 180 / Math.PI, rate, Math.round(performance.now() - t0)]);
+}, 50);
+
+// ---- ブレーキ操作で映像を減速させる ----
+// トリガーを押している間、映像の速度が BRAKE_MIN_RATE 倍まで下がる。離すと元の速度(1.0倍)に戻る。
+const BRAKE_MIN_RATE = 0.3;  // 最小の速度（0.3倍）
+const DECEL_SEC = 0.5;       // 押してから最小速度に達するまでの時間（秒）
+const RECOVER_SEC = 1.0;     // 離してから元の速度に戻るまでの時間（秒）
+let rate = 1;
+let lastTick = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const dt = (now - lastTick) / 1000;
+  lastTick = now;
+  if (!playing || !video) return;
+  const target = pressed ? BRAKE_MIN_RATE : 1;
+  const slope = (1 - BRAKE_MIN_RATE) / (pressed ? DECEL_SEC : RECOVER_SEC);
+  if (rate > target) rate = Math.max(target, rate - slope * dt);
+  else rate = Math.min(target, rate + slope * dt);
+  if (Math.abs(video.playbackRate - rate) > 0.01 || rate === 1 || rate === BRAKE_MIN_RATE) {
+    video.playbackRate = rate;
+  }
+}, 30);
+
+// ---- 開始 ----
+$('start').onclick = () => {
+  const file = $('file').files[0];
+  meta = { pid: $('pid').value.trim(), cond: $('cond').value.trim() || 'unnamed' };
+  events = []; head = []; pressed = false; playing = false; finished = false;
+
+  video = document.createElement('video');
+  video.id = 'vid';
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.src = URL.createObjectURL(file);
+  $('assets').appendChild(video);
+  video.load();
+
+  sphere = document.createElement('a-videosphere');
+  sphere.setAttribute('src', '#vid');
+  sphere.setAttribute('rotation', '0 ' + (parseFloat($('yawOffset').value) || 0) + ' 0');
+  scene.appendChild(sphere);
+
+  loadingText = document.createElement('a-text');
+  loadingText.setAttribute('value', 'Loading...');
+  loadingText.setAttribute('position', '0 0 -2');
+  loadingText.setAttribute('align', 'center');
+  loadingText.setAttribute('width', '3');
+  $('cam').appendChild(loadingText);
+
+  $('ui').classList.add('hide');
+  $('ui').style.display = 'none';
+
+  if (vrOK) scene.enterVR().catch(err => { console.error(err); });
+
+  const begin = () => {
+    setTimeout(() => {
+      if (loadingText) { loadingText.remove(); loadingText = null; }
+      t0 = performance.now();
+      rate = 1;
+      video.playbackRate = 1;
+      playing = true;
+      video.play().catch(err => { setStatus('再生エラー: ' + err); finish(true); });
+    }, 3000); // VRに入ってから3秒待って再生開始
+  };
+  if (video.readyState >= 3) begin();
+  else video.addEventListener('canplay', begin, { once: true });
+
+  video.addEventListener('ended', () => finish(false), { once: true });
+  video.addEventListener('error', () => { setStatus('動画を読み込めませんでした。形式を確認してください。'); finish(true); }, { once: true });
+};
+
+// ---- 終了 ----
+function finish(aborted) {
+  if (finished) return;
+  finished = true;
+  if (pressed) { pressed = false; log('release', 'auto_end'); }
+  playing = false;
+  try { video.pause(); } catch (e) {}
+  if (scene.is('vr-mode')) scene.exitVR();
+  if (sphere) { sphere.remove(); sphere = null; }
+  if (loadingText) { loadingText.remove(); loadingText = null; }
+
+  $('ui').style.display = '';
+  $('ui').classList.remove('hide');
+  $('form').classList.add('hide');
+  $('results').classList.remove('hide');
+  renderSummary(aborted);
+
+  try { localStorage.setItem('brake_' + meta.pid + '_' + meta.cond + '_' + Date.now(),
+        JSON.stringify({ meta, events, head })); } catch (e) {}
+}
+
+function renderSummary(aborted) {
+  const rows = [];
+  let start = null;
+  for (const e of events) {
+    if (e.event === 'press') start = e.t;
+    else if (e.event === 'release' && start !== null) { rows.push([start, e.t, e.t - start]); start = null; }
+  }
+  let html = (aborted ? '<p>※ 途中で中断されました。</p>' : '') +
+    '<p>被験者: ' + meta.pid + ' / 条件: ' + meta.cond + ' / 押下回数: ' + rows.length + '</p>';
+  if (rows.length) {
+    html += '<table><tr><th>#</th><th>押し始め(秒)</th><th>離した(秒)</th><th>押していた時間(秒)</th></tr>';
+    rows.forEach((r, i) => {
+      html += '<tr><td>' + (i + 1) + '</td><td>' + r[0].toFixed(2) + '</td><td>' + r[1].toFixed(2) + '</td><td>' + r[2].toFixed(2) + '</td></tr>';
+    });
+    html += '</table>';
+  }
+  $('summary').innerHTML = html;
+}
+
+// ---- CSV ----
+const esc = s => '"' + String(s).replace(/"/g, '""') + '"';
+function download(name, text) {
+  const blob = new Blob(['\ufeff' + text], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+$('dlEvents').onclick = () => {
+  let csv = 'participant,condition,event,hand,video_time_s,wall_ms,speed_rate\n';
+  for (const e of events) csv += [esc(meta.pid), esc(meta.cond), e.event, e.hand, e.t.toFixed(3), e.wall, e.rate].join(',') + '\n';
+  download(meta.pid + '_' + meta.cond + '_events.csv', csv);
+};
+$('dlHead').onclick = () => {
+  let csv = 'participant,condition,video_time_s,yaw_deg,pitch_deg,speed_rate,wall_ms\n';
+  for (const h of head) csv += [esc(meta.pid), esc(meta.cond), h[0].toFixed(3), h[1].toFixed(1), h[2].toFixed(1), h[3].toFixed(2), h[4]].join(',') + '\n';
+  download(meta.pid + '_' + meta.cond + '_head.csv', csv);
+};
+$('again').onclick = () => {
+  $('results').classList.add('hide');
+  $('form').classList.remove('hide');
+  $('file').value = '';
+  $('cond').value = '';
+  if (video) { video.remove(); video = null; }
+  checkReady();
+  setStatus('');
+};
+</script>
+</body>
+</html>
